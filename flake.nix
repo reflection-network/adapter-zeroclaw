@@ -47,6 +47,8 @@
                 hash = archInfo.hash;
               };
               sourceRoot = ".";
+              nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+              buildInputs = [ pkgs.stdenv.cc.cc.lib ];
               dontConfigure = true;
               dontBuild = true;
               installPhase = ''
@@ -147,9 +149,25 @@
               mkdir -p "$WORKSPACE" "$ZC_DIR"
               ${if useClaudeCode then ''mkdir -p "$HOME/.claude"'' else ""}
 
-              # Copy baked config and identity to writable locations
+              # Copy baked config to writable location
               cp /etc/zeroclaw/config.toml "$ZC_DIR/config.toml"
               cp /etc/zeroclaw/IDENTITY.md "$WORKSPACE/IDENTITY.md"
+
+              # Inject runtime secrets into config
+              ${if telegramEnabled then ''
+              if [ -n "''${TELEGRAM_BOT_TOKEN:-}" ]; then
+                ${pkgs.gnused}/bin/sed -i "s|\[channels_config\.telegram\]|[channels_config.telegram]\nbot_token = \"$TELEGRAM_BOT_TOKEN\"|" "$ZC_DIR/config.toml"
+              else
+                echo "WARNING: TELEGRAM_BOT_TOKEN not set, disabling telegram" >&2
+                ${pkgs.gnused}/bin/sed -i '/\[channels_config\.telegram\]/,/^$/d' "$ZC_DIR/config.toml"
+              fi
+              '' else ""}
+
+              ${if !useClaudeCode then ''
+              if [ -n "''${API_KEY:-}" ]; then
+                ${pkgs.gnused}/bin/sed -i "1i api_key = \"$API_KEY\"" "$ZC_DIR/config.toml"
+              fi
+              '' else ""}
 
               export ZEROCLAW_WORKSPACE="$WORKSPACE"
 
