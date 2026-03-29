@@ -36,9 +36,14 @@ nix build .#docker
 docker load < result
 docker run -d --memory 4g \
   -e TELEGRAM_BOT_TOKEN=<token> \
+  -e AGENT_HOSTNAME=https://your-agent.example.com \
+  -p 8080:8080 \
+  -v agent-home:/home/agent \
   -v ~/.claude/.credentials.json:/home/agent/.claude/.credentials.json \
   ada:latest
 ```
+
+The container exposes port 8080 — an nginx web server proxying all requests to ZeroClaw's gateway. Specific paths defined in agent.nix (like `/hello`) take priority over the catch-all proxy.
 
 ## Agent config fields
 
@@ -107,6 +112,7 @@ ZeroClaw supports 15+ LLM providers. Set `provider` to the provider name and pas
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | When Telegram enabled | Bot token from [@BotFather](https://t.me/BotFather) |
 | `API_KEY` | When `provider != "claude-code"` | LLM provider API key |
+| `AGENT_HOSTNAME` | For public URL | Public base URL of the agent (e.g. `https://agent.example.com`). Used by ZeroClaw to generate correct links in Telegram messages. Defaults to `http://localhost:8080`. |
 
 ### Volume mounts
 
@@ -129,24 +135,40 @@ Without a memory limit, a runaway allocation on a server without swap can make t
 ```
 Capsule flake.nix
   └─ adapter-zeroclaw.lib.mkAgent { agent config }
-       ├─ agent-nix.lib.mkAgent (validation + devShell)
+       ├─ agent-nix.lib.mkAgent (validation + devShell + web)
        └─ Docker image
             ├─ zeroclaw (Rust binary, 8 MB)
+            ├─ nginx + static page (from agent.nix web output)
             ├─ bash, coreutils, cacert
             ├─ claude-code, curl, jq (only when provider = "claude-code")
             ├─ /etc/zeroclaw/config.toml (generated from agent config)
             ├─ /etc/zeroclaw/IDENTITY.md (agent's system prompt)
+            ├─ /etc/zeroclaw/tunnel-url.sh (public URL script)
+            ├─ /etc/nginx/conf.d/gateway.conf (reverse proxy config)
             └─ entrypoint
                  ├─ Copies config to writable ~/.zeroclaw/
                  ├─ Injects TELEGRAM_BOT_TOKEN and API_KEY into config
+                 ├─ Starts nginx (from agent.nix web.startCmd)
                  └─ Runs: zeroclaw daemon
 ```
+
+### Web server and reverse proxy
+
+nginx (from agent.nix) listens on port 8080. The adapter adds a catch-all `location /` proxy in `/etc/nginx/conf.d/gateway.conf` that forwards all requests to ZeroClaw's gateway (port 42617), including WebSocket upgrades.
+
+More specific locations defined in agent.nix (e.g. `/hello`) take priority over the catch-all proxy. This allows agent.nix to claim paths for agent-level services while the adapter handles everything else.
+
+ZeroClaw endpoints accessible through nginx: health, webhook, REST API, WebSocket chat (`/ws/chat`), web dashboard, metrics.
+
+### Public URL
+
+ZeroClaw needs to know its public URL to generate correct links in Telegram messages. The adapter uses a custom tunnel script that reads `AGENT_HOSTNAME` from the environment and outputs it as the public URL. No real tunnel is needed — nginx handles the reverse proxy and the hostname is known at deploy time.
 
 ### Config generation
 
 The adapter generates two files from the capsule's agent attributes:
 
-- **`config.toml`** — ZeroClaw's main config: provider, model, channel settings, memory backend, autonomy level. Baked at build time, secrets injected at runtime via sed.
+- **`config.toml`** — ZeroClaw's main config: provider, model, channel settings, memory backend, autonomy level, gateway settings (including `trust_forwarded_headers = true`), and custom tunnel config. Baked at build time, secrets injected at runtime via sed.
 - **`IDENTITY.md`** — The agent's system prompt. ZeroClaw reads workspace identity files at startup and injects them into the LLM system prompt.
 
 ### Telegram pairing

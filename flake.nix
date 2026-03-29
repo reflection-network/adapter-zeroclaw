@@ -117,6 +117,15 @@
               port = 42617
               host = "0.0.0.0"
               allow_public_bind = true
+              trust_forwarded_headers = true
+              require_pairing = false
+
+              [tunnel]
+              provider = "custom"
+
+              [tunnel.custom]
+              start_command = "/etc/zeroclaw/tunnel-url.sh"
+              url_pattern = "http"
             '';
 
             # ── Generated IDENTITY.md ───────────────────────────────
@@ -126,11 +135,20 @@
               ${agent.system-prompt}
             '';
 
+            tunnelUrlScript = pkgs.writeScript "tunnel-url.sh" ''
+              #!${pkgs.bash}/bin/bash
+              HOST="''${AGENT_HOSTNAME:-http://localhost:8080}"
+              HOST="''${HOST%/}"
+              echo "$HOST"
+              exec ${pkgs.coreutils}/bin/sleep infinity
+            '';
+
             # ── Config files bundle ─────────────────────────────────
             configFiles = pkgs.runCommand "zeroclaw-config" {} ''
               mkdir -p $out/etc/zeroclaw
               cp ${configToml} $out/etc/zeroclaw/config.toml
               cp ${identityMd} $out/etc/zeroclaw/IDENTITY.md
+              cp ${tunnelUrlScript} $out/etc/zeroclaw/tunnel-url.sh
             '';
 
             # ── Runtime dependencies ────────────────────────────────
@@ -149,9 +167,9 @@
               mkdir -p "$WORKSPACE" "$ZC_DIR"
               ${if useClaudeCode then ''mkdir -p "$HOME/.claude"'' else ""}
 
-              # Copy baked config to writable location
-              cp /etc/zeroclaw/config.toml "$ZC_DIR/config.toml"
-              cp /etc/zeroclaw/IDENTITY.md "$WORKSPACE/IDENTITY.md"
+              # Copy baked config to writable location (force-overwrite read-only copies from previous runs)
+              install -m 644 /etc/zeroclaw/config.toml "$ZC_DIR/config.toml"
+              install -m 644 /etc/zeroclaw/IDENTITY.md "$WORKSPACE/IDENTITY.md"
 
               # Inject runtime secrets into config
               ${if telegramEnabled then ''
@@ -171,6 +189,7 @@
 
               export ZEROCLAW_WORKSPACE="$WORKSPACE"
 
+              ${web.startCmd}
               exec zeroclaw daemon
             '';
 
@@ -183,11 +202,28 @@
               echo "agent:x:1000:" >> $out/etc/group
             '';
 
+            # ── Web (from agent.nix) ───────────────────────────────
+            web = base.web.${system};
+
+            gatewayProxyConf = pkgs.writeText "gateway.conf" ''
+              location / {
+                proxy_pass http://127.0.0.1:42617;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+              }
+            '';
+
+            gatewayConfDir = pkgs.runCommand "gateway-conf-dir" {} ''
+              mkdir -p $out/etc/nginx/conf.d
+              cp ${gatewayProxyConf} $out/etc/nginx/conf.d/gateway.conf
+            '';
+
             imageName = builtins.replaceStrings [ " " ] [ "-" ]
               (pkgs.lib.toLower agent.name);
           in
           {
-            devShells = base.${system}.devShells or {};
+            devShells = base.devShells.${system} or {};
 
             packages.docker = pkgs.dockerTools.buildLayeredImage {
               name = imageName;
@@ -199,13 +235,15 @@
                 zeroclaw-bin
                 etcFiles
                 configFiles
-              ] ++ pkgs.lib.optionals useClaudeCode [
+                gatewayConfDir
+              ] ++ web.packages
+                ++ pkgs.lib.optionals useClaudeCode [
                 pkgs.claude-code
                 pkgs.curl
                 pkgs.jq
               ];
               fakeRootCommands = ''
-                mkdir -p home/agent/.zeroclaw home/agent/workspace tmp
+                mkdir -p home/agent/.zeroclaw home/agent/workspace tmp srv/www
                 ${if useClaudeCode then "mkdir -p home/agent/.claude" else ""}
                 chmod 1777 tmp
                 chown -R 1000:1000 home/agent
@@ -218,6 +256,7 @@
                 ];
                 WorkingDir = "/home/agent";
                 Entrypoint = [ "${entrypoint}" ];
+                ExposedPorts = { "${toString web.port}/tcp" = {}; };
               };
             };
           }
